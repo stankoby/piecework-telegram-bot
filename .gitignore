@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# Env
+.env
+
+# Local data
+piecework.db
