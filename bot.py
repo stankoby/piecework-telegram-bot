@@ -1,4 +1,5 @@
-import os, sqlite3, logging, io, csv
+import os, sqlite3, logging, io, csv, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 from dateutil.tz import gettz
 from telegram import (
@@ -12,10 +13,27 @@ from telegram.ext import (
 
 # ---------- НАСТРОЙКИ ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен от @BotFather
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")  # пример IANA: Asia/Novosibirsk
 DB_FILE = os.getenv("DB_FILE", "piecework.db")
 ADMIN_IDS = set(map(int, filter(None, os.getenv("ADMIN_IDS", "").split(","))))  # через запятую
 ADMIN_USERNAMES = set(u.lstrip("@").lower() for u in filter(None, os.getenv("ADMIN_USERNAMES", "").split(",")))
+
+# ---------- ЛЕГКИЙ HEALTH HTTP-СЕРВЕР ДЛЯ RENDER ----------
+def start_health_server():
+    """Поднимаем простой HTTP-сервер, чтобы Render видел открытый порт."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args, **kwargs):
+            return  # глушим логи
+
+    port = int(os.getenv("PORT", "10000"))  # Render задаёт PORT
+    srv = HTTPServer(("0.0.0.0", port), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    logging.info(f"Health server started on port {port}")
 
 # ---------- БД (SQLite) ----------
 def db():
@@ -45,10 +63,36 @@ def init_db():
     conn.commit()
     conn.close()
 
+def seed_default_rates():
+    """Автозасев расценок при старте (апсертит значения)."""
+    defaults = [
+        ("Очки открытые (пленка)", 5.0),
+        ("Очки открытые (пакет)", 3.0),
+        ("Очки закрытые (пленка)", 6.0),
+        ("Очки закрытые (пакет)", 3.0),
+        ("Беруши (3 шт)", 3.0),
+        ("Беруши (10 шт)", 5.0),
+        ("Респираторы (3-5 шт)", 4.0),
+        ("Респираторы (10 шт в пакетиках)", 6.0),
+        ("Респираторы в коробочках (10 шт)", 10.0),
+        ("Перчатки", 3.0),
+        ("Крем", 3.0),
+        ("Краги", 4.0),
+        ("Наушники", 4.0),
+    ]
+    conn = db(); cur = conn.cursor()
+    cur.executemany(
+        "insert into rates(product, rate) values(?, ?) "
+        "on conflict(product) do update set rate=excluded.rate",
+        defaults
+    )
+    conn.commit(); conn.close()
+    logging.info("Default rates seeded.")
+
 def get_rates():
     conn = db(); cur = conn.cursor()
     cur.execute("select product, rate from rates order by product")
-    r = {row["product"]: float(row["rate"]) for row in cur.fetchall()}
+    r = {row["product"]: float(row["rate"]) for row in cur.fetchall()} if cur else {}
     conn.close()
     return r
 
@@ -95,9 +139,7 @@ def main_kb():
     )
 def product_kb(rates):
     btns, row = [], []
-    items = list(rates.items())
-    # Стабильный порядок
-    items.sort(key=lambda x: x[0])
+    items = sorted(rates.items(), key=lambda x: x[0])
     for i, (name, rate) in enumerate(items, start=1):
         row.append(InlineKeyboardButton(f"{name} ({rate:g}₽)", callback_data=f"prod|{name}"))
         if i % 2 == 0: btns.append(row); row=[]
@@ -131,7 +173,6 @@ async def setrate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, update.effective_user.username):
         await update.message.reply_text("Только админ может менять расценки.")
         return
-    # формат: /setrate Перчатки 3.5
     parts = (update.message.text or "").split(maxsplit=2)
     if len(parts) < 3:
         await update.message.reply_text("Использование: /setrate <Название> <Ставка>")
@@ -224,6 +265,7 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_app():
     logging.basicConfig(level=logging.INFO)
     init_db()
+    seed_default_rates()  # гарантируем ставки на старте
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -235,7 +277,6 @@ def build_app():
     app.add_handler(CommandHandler("backup", backup_db))
 
     conv = ConversationHandler(
-        
         entry_points=[CommandHandler("log", ask_product),
                       MessageHandler(filters.Regex("^➕"), ask_product)],
         states={
@@ -256,6 +297,10 @@ def build_app():
 if __name__ == "__main__":
     if not BOT_TOKEN:
         raise RuntimeError("Set BOT_TOKEN env var.")
+    # Запускаем health HTTP-порт, чтобы Render прошёл port-scan
+    start_health_server()
+
+    # Python 3.14: явно создаём event loop
     import asyncio
     try:
         loop = asyncio.get_running_loop()
